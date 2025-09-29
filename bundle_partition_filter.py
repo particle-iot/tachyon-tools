@@ -159,6 +159,64 @@ def _parse_start_address(attrs: Dict[str, str]) -> Optional[int]:
         return start_sector * (sector_bytes or 512)
     return None
 
+def _parse_physical_partition(attrs: Dict[str, str]) -> Optional[int]:
+    lower = {k.lower(): v for k, v in attrs.items()}
+    try:
+        return int(lower.get("physical_partition_number", ""))
+    except ValueError:
+        return None
+
+def compute_lun_offsets(bundle_zip: str) -> Dict[int, int]:
+    """
+    Compute physical offsets for each LUN based on the assumption that LUNs
+    are laid out sequentially. This is a heuristic - actual hardware may differ.
+    Returns: {lun_num: base_offset}
+
+    Note: In reality, UFS LUNs are independent storage units and don't have
+    a linear physical address space. This function provides a hypothetical
+    sequential layout for visualization purposes only.
+    """
+    lun_sizes: Dict[int, int] = {}
+
+    with zipfile.ZipFile(bundle_zip, "r") as zf:
+        zip_sizes = collect_zip_sizes(zf)
+
+        for name, data in iter_bundle_xml_entries(zf):
+            if PATCH_RE.search(name):
+                continue
+            try:
+                tree = parse_xml(data)
+            except ET.ParseError:
+                continue
+
+            for elem in tree.getroot().iter():
+                if elem.tag not in PROGRAM_TAGS:
+                    continue
+
+                lun = _parse_physical_partition(elem.attrib)
+                addr = _parse_start_address(elem.attrib)
+                size = compute_program_size_bytes(elem.attrib, zip_sizes)
+
+                if lun is not None and addr is not None:
+                    # Track the highest end address for this LUN
+                    if size is not None:
+                        end_addr = addr + size
+                    else:
+                        # If no size, just use the address + a nominal amount
+                        end_addr = addr + 4096
+
+                    if lun not in lun_sizes or end_addr > lun_sizes[lun]:
+                        lun_sizes[lun] = end_addr
+
+    # Compute cumulative offsets (hypothetical sequential layout)
+    lun_offsets: Dict[int, int] = {}
+    offset = 0
+    for lun_num in sorted(lun_sizes.keys()):
+        lun_offsets[lun_num] = offset
+        offset += lun_sizes[lun_num]
+
+    return lun_offsets
+
 # ----------------------------------------------------------------------
 # list
 # ----------------------------------------------------------------------
@@ -174,18 +232,28 @@ def _split_slot(part: str) -> Tuple[str, str]:
 def list_partitions(bundle_zip: str, sort_by: str = "name",
                     parts: Optional[Set[str]] = None,
                     slot: Optional[str] = None,
-                    ignore_case: bool = False) -> int:
+                    ignore_case: bool = False,
+                    print_lun: bool = False,
+                    use_phy_address: bool = False) -> int:
     """
     List partitions from rawprogram XMLs only, optionally filtered like OTA:
       - parts: exact/wildcard partition filters (e.g., system_a,*_b)
       - slot:  'a' or 'b' to select *_a / *_b
       - ignore_case: case-insensitive matching
+      - print_lun: print LUN offset table before partition listing
+      - use_phy_address: show physical addresses (LUN offset + partition offset), default is LUN-relative
 
-    Columns: Base | Slot | File Size | Addr | File
+    Columns: Base | Slot | File Size | LUN | Addr | File
       - File Size: sum of sizes of unique referenced files for that (base,slot)
-      - Addr: min start address (hex) across entries, 'N/A' if unknown
+      - LUN: physical partition number
+      - Addr: address (LUN-relative by default, or physical if use_phy_address=True)
       - File: single basename if exactly one file; else '(N files)'
     """
+    # Compute LUN offsets if physical addressing requested
+    lun_offsets: Dict[int, int] = {}
+    if use_phy_address:
+        lun_offsets = compute_lun_offsets(bundle_zip)
+
     with zipfile.ZipFile(bundle_zip, "r") as zf:
         zip_sizes = collect_zip_sizes(zf)
 
@@ -193,7 +261,10 @@ def list_partitions(bundle_zip: str, sort_by: str = "name",
         parts = parts or set()
         matcher = build_matcher(parts, ignore_case=ignore_case, slot=slot)
 
-        # (base,slot) -> { files:set, total_size:int, addr_min:Optional[int] }
+        # Track LUN information for --print-lun
+        lun_info: Dict[int, Dict[str, object]] = {}  # lun_num -> {min_addr, max_addr, partition_count, offset}
+
+        # (base,slot) -> { files:set, total_size:int, addr_min:Optional[int], lun:Optional[int] }
         agg: Dict[Tuple[str, str], Dict[str, object]] = {}
 
         for name, data in iter_bundle_xml_entries(zf):
@@ -238,20 +309,72 @@ def list_partitions(bundle_zip: str, sort_by: str = "name",
                                 break
 
                 addr_b = _parse_start_address(elem.attrib)
+                lun_num = _parse_physical_partition(elem.attrib)
+
+                # Track LUN info
+                if lun_num is not None and addr_b is not None:
+                    if lun_num not in lun_info:
+                        lun_offset = lun_offsets.get(lun_num, 0) if use_phy_address else 0
+                        lun_info[lun_num] = {"min_addr": addr_b, "max_addr": addr_b, "partition_count": 0, "offset": lun_offset}
+                    lun_rec = lun_info[lun_num]
+                    if addr_b < lun_rec["min_addr"]:  # type: ignore
+                        lun_rec["min_addr"] = addr_b  # type: ignore
+                    if addr_b > lun_rec["max_addr"]:  # type: ignore
+                        lun_rec["max_addr"] = addr_b  # type: ignore
+                    lun_rec["partition_count"] = int(lun_rec["partition_count"]) + 1  # type: ignore
+
+                # Calculate display address (LUN-relative or physical)
+                display_addr = addr_b
+                if use_phy_address and addr_b is not None and lun_num is not None:
+                    display_addr = addr_b + lun_offsets.get(lun_num, 0)
 
                 key = (base_name, slot_tag)
-                rec = agg.setdefault(key, {"files": set(), "total_size": 0, "addr_min": None})
+                rec = agg.setdefault(key, {"files": set(), "total_size": 0, "addr_min": None, "lun": None})
                 files: Set[str] = rec["files"]  # type: ignore
                 if file_base and file_base not in files:
                     files.add(file_base)
                     rec["total_size"] = int(rec["total_size"]) + (size_b or 0)  # type: ignore
-                if addr_b is not None:
-                    if rec["addr_min"] is None or addr_b < rec["addr_min"]:  # type: ignore
-                        rec["addr_min"] = addr_b  # type: ignore
+                if display_addr is not None:
+                    if rec["addr_min"] is None or display_addr < rec["addr_min"]:  # type: ignore
+                        rec["addr_min"] = display_addr  # type: ignore
+                        rec["lun"] = lun_num  # type: ignore
 
         if not agg:
             print("No partitions found in rawprogram XMLs.")
             return 0
+
+        # Print LUN table if requested
+        if print_lun and lun_info:
+            print("LUN Offset Table:")
+            print("=" * 80)
+            lun_rows = []
+            for lun_num in sorted(lun_info.keys()):
+                info = lun_info[lun_num]
+                offset = info.get("offset", 0)  # type: ignore
+                lun_rows.append((lun_num, offset, info["min_addr"], info["max_addr"], info["partition_count"]))
+
+            col_lun = max(len("LUN"), max(len(str(r[0])) for r in lun_rows))
+            col_off = max(len("Base Offset"), max(len(f"0x{r[1]:016X}") if isinstance(r[1], int) else 3 for r in lun_rows))  # type: ignore
+            col_min = max(len("Min Addr"), max(len(f"0x{r[2]:016X}") if isinstance(r[2], int) else 3 for r in lun_rows))  # type: ignore
+            col_max = max(len("Max Addr"), max(len(f"0x{r[3]:016X}") if isinstance(r[3], int) else 3 for r in lun_rows))  # type: ignore
+            col_cnt = max(len("Partitions"), max(len(str(r[4])) for r in lun_rows))
+
+            if use_phy_address:
+                print(f"{'LUN'.ljust(col_lun)}  {'Base Offset'.ljust(col_off)}  {'Min Addr'.ljust(col_min)}  {'Max Addr'.ljust(col_max)}  {'Partitions'.ljust(col_cnt)}")
+                print(f"{'-'*col_lun}  {'-'*col_off}  {'-'*col_min}  {'-'*col_max}  {'-'*col_cnt}")
+                for lun_num, off, min_a, max_a, cnt in lun_rows:
+                    off_s = f"0x{off:016X}" if isinstance(off, int) else "N/A"  # type: ignore
+                    min_s = f"0x{min_a:016X}" if isinstance(min_a, int) else "N/A"  # type: ignore
+                    max_s = f"0x{max_a:016X}" if isinstance(max_a, int) else "N/A"  # type: ignore
+                    print(f"{str(lun_num).ljust(col_lun)}  {off_s.ljust(col_off)}  {min_s.ljust(col_min)}  {max_s.ljust(col_max)}  {str(cnt).ljust(col_cnt)}")
+            else:
+                print(f"{'LUN'.ljust(col_lun)}  {'Min Addr'.ljust(col_min)}  {'Max Addr'.ljust(col_max)}  {'Partitions'.ljust(col_cnt)}")
+                print(f"{'-'*col_lun}  {'-'*col_min}  {'-'*col_max}  {'-'*col_cnt}")
+                for lun_num, off, min_a, max_a, cnt in lun_rows:
+                    min_s = f"0x{min_a:016X}" if isinstance(min_a, int) else "N/A"  # type: ignore
+                    max_s = f"0x{max_a:016X}" if isinstance(max_a, int) else "N/A"  # type: ignore
+                    print(f"{str(lun_num).ljust(col_lun)}  {min_s.ljust(col_min)}  {max_s.ljust(col_max)}  {str(cnt).ljust(col_cnt)}")
+            print()
 
         # Build rows for printing
         rows = []
@@ -259,37 +382,41 @@ def list_partitions(bundle_zip: str, sort_by: str = "name",
             files: Set[str] = rec["files"]  # type: ignore
             total_size = rec["total_size"]  # type: ignore
             addr_min = rec["addr_min"]      # type: ignore
+            lun = rec["lun"]                # type: ignore
             if len(files) == 0:
                 file_display = ""
             elif len(files) == 1:
                 file_display = next(iter(files))
             else:
                 file_display = f"({len(files)} files)"
-            rows.append((base_name, slot_tag, total_size, addr_min, file_display))
+            rows.append((base_name, slot_tag, total_size, lun, addr_min, file_display))
 
         # Sorting
         if sort_by == "addr":
-            rows.sort(key=lambda r: (r[3] is None, r[3] if r[3] is not None else 1 << 64))
+            # Sort by LUN first, then address within LUN
+            rows.sort(key=lambda r: (r[3] is None, r[3] if r[3] is not None else 1 << 64, r[4] is None, r[4] if r[4] is not None else 1 << 64))
         else:
             # name: Base asc, then Slot order A,B,—
             slot_order = {"A": 0, "B": 1, "—": 2}
-            rows.sort(key=lambda r: (r[0], slot_order.get(r[1], 3), r[4]))
+            rows.sort(key=lambda r: (r[0], slot_order.get(r[1], 3), r[5]))
 
         # Column widths
         size_strs = [human_bytes(r[2]) for r in rows]
-        addr_strs = [f"0x{r[3]:016X}" if isinstance(r[3], int) else "N/A" for r in rows]
+        lun_strs = [str(r[3]) if r[3] is not None else "?" for r in rows]
+        addr_strs = [f"0x{r[4]:016X}" if isinstance(r[4], int) else "N/A" for r in rows]
 
         col_base = max(len("Base"), max(len(r[0]) for r in rows))
         col_slot = max(len("Slot"), max(len(r[1]) for r in rows))
         col_size = max(len("File Size"), max(len(s) for s in size_strs))
+        col_lun = max(len("LUN"), max(len(s) for s in lun_strs))
         col_addr = max(len("Addr"), max(len(s) for s in addr_strs))
-        col_file = max(len("File"), max(len(r[4]) for r in rows))
+        col_file = max(len("File"), max(len(r[5]) for r in rows))
 
         # Print
-        print(f"{'Base'.ljust(col_base)}  {'Slot'.ljust(col_slot)}  {'File Size'.ljust(col_size)}  {'Addr'.ljust(col_addr)}  {'File'.ljust(col_file)}")
-        print(f"{'-'*col_base}  {'-'*col_slot}  {'-'*col_size}  {'-'*col_addr}  {'-'*col_file}")
-        for (base_name, slot_tag, total_size, addr_min, file_display), size_s, addr_s in zip(rows, size_strs, addr_strs):
-            print(f"{base_name.ljust(col_base)}  {slot_tag.ljust(col_slot)}  {size_s.ljust(col_size)}  {addr_s.ljust(col_addr)}  {file_display.ljust(col_file)}")
+        print(f"{'Base'.ljust(col_base)}  {'Slot'.ljust(col_slot)}  {'File Size'.ljust(col_size)}  {'LUN'.ljust(col_lun)}  {'Addr'.ljust(col_addr)}  {'File'.ljust(col_file)}")
+        print(f"{'-'*col_base}  {'-'*col_slot}  {'-'*col_size}  {'-'*col_lun}  {'-'*col_addr}  {'-'*col_file}")
+        for (base_name, slot_tag, total_size, lun, addr_min, file_display), size_s, lun_s, addr_s in zip(rows, size_strs, lun_strs, addr_strs):
+            print(f"{base_name.ljust(col_base)}  {slot_tag.ljust(col_slot)}  {size_s.ljust(col_size)}  {lun_s.ljust(col_lun)}  {addr_s.ljust(col_addr)}  {file_display.ljust(col_file)}")
 
     return 0
 
@@ -507,6 +634,19 @@ def main(argv=None) -> int:
         "--ignore-case", action="store_true",
         help="Case-insensitive partition name matching"
     )
+    sp_list.add_argument(
+        "--print-lun", action="store_true",
+        help="Print LUN offset table before partition listing"
+    )
+    addr_group = sp_list.add_mutually_exclusive_group()
+    addr_group.add_argument(
+        "--use-lun-address", action="store_true", default=True,
+        help="Show LUN-relative addresses (default)"
+    )
+    addr_group.add_argument(
+        "--use-phy-address", action="store_true",
+        help="Show physical addresses (LUN base offset + partition offset)"
+    )
 
     # validate
     sp_val = sub.add_parser("validate", help="Check referenced EDL files match actual files in the bundle")
@@ -544,6 +684,8 @@ def main(argv=None) -> int:
             parts=parts,
             slot=getattr(args, "slot", None),
             ignore_case=getattr(args, "ignore_case", False),
+            print_lun=getattr(args, "print_lun", False),
+            use_phy_address=getattr(args, "use_phy_address", False),
         )
 
     if args.cmd == "validate":
