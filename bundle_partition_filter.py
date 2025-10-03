@@ -4,24 +4,41 @@ bundle_partition_filter.py
 
 Operate on **bundles** (ZIP files) that contain:
   - manifest.json
-  - images/qcm6490/edl/*.xml  (rawprogram*.xml and patch*.xml alongside image files like dtbo.img)
+  - images/qcm6490/edl/*  (rawprogram*.xml, patch*.xml, image payloads e.g. dtbo.img, GPT bins, firehose ELF)
 
 Commands:
-  - list        : Show partitions (collapsed), total file size, min start address, and file(s).
-  - validate    : Verify that every file referenced by rawprogram or patch XML exists in EDL, and that
-                  there are no extra files present (with a whitelist for common Firehose loaders).
-  - filter-in   : Keep ONLY the listed partitions (or slot), rewrite XMLs, and remove unreferenced EDL files.
-  - filter-out  : REMOVE the listed partitions (or slot), rewrite XMLs, and remove now-unreferenced EDL files.
+  - list        : Show partitions (collapsed), total file size, min start address, and file(s). Supports LUN-relative
+                  or physical addresses (sequential LUN-offset heuristic).
+  - validate    : Verify that every file referenced by rawprogram/patch XML exists in EDL and report extras
+                  (with a whitelist for common Firehose loaders). Also performs a non-fatal sanity check that
+                  manifest.json's program_xml/patch_xml entries correspond to EDL XMLs actually present.
+  - filter-in   : Keep ONLY the listed partitions (or slot), rewrite XMLs, drop now-unreferenced EDL payloads,
+                  and update manifest.json program_xml/patch_xml.
+  - filter-out  : REMOVE the listed partitions (or slot), rewrite XMLs, drop now-unreferenced EDL payloads,
+                  and update manifest.json program_xml/patch_xml.
 
 Matching:
   - Exact by default; supports wildcards in --partitions (fnmatch), and --slot a|b for *_a / *_b.
   - --ignore-case for case-insensitive matches.
 
 Listing:
-  - Skips patch*.xml.
-  - Collapses duplicates by partition.
-  - Size prefers actual file size in bundle; falls back to sector math; then size_in_kb.
-  - Address best-effort: start_byte_hex or start_sector × sector_size (default 512).
+  - Skips patch*.xml for the partition table (patch files do not define new partitions).
+  - Collapses duplicates by partition (base + slot).
+  - File size prefers the actual ZIP entry size; falls back to sector math; then size_in_kb.
+  - Address best-effort: start_byte_hex or (start_sector × sector_size, default 512).
+  - Optional "--use-phy-address" adds a hypothetical LUN base offset (sequential layout heuristic) to show
+    'physical' addresses; otherwise shows LUN-relative addresses.
+
+Filtering rules:
+  - PATCH ELEMENTS ARE NEVER FILTERED (patch*.xml retained). Their referenced GPT/metadata files are kept if referenced.
+  - If a rawprogram*.xml becomes empty post-filter (no <program>/<erase>), it is omitted from the output ZIP.
+  - Unreferenced EDL payload files are pruned.
+  - Firehose loaders are ALWAYS KEPT: {prog_firehose_ddr.elf, prog_firehose_lite.elf, prog_firehose.elf}.
+  - manifest.json is rewritten so its program_xml/patch_xml arrays list only the XMLs that remain.
+
+Validation:
+  - Runs after filter-in/out is written. Non-zero exit on missing/extra EDL payloads (excluding whitelisted Firehose).
+  - Emits a friendly warning if manifest.json lists XMLs not present in EDL (non-fatal).
 """
 
 import argparse
