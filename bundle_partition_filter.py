@@ -31,6 +31,7 @@ import os
 import re
 import sys
 import zipfile
+import json
 from xml.etree import ElementTree as ET
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
@@ -55,6 +56,8 @@ DEFAULT_EXTRA_WHITELIST = {
     "prog_firehose_lite.elf",
     "prog_firehose.elf",
 }
+
+ALWAYS_KEEP_IN_EDL = set(DEFAULT_EXTRA_WHITELIST)
 
 # ----------------------------------------------------------------------
 # Utilities
@@ -179,34 +182,47 @@ def compute_lun_offsets(bundle_zip: str) -> Dict[int, int]:
     lun_sizes: Dict[int, int] = {}
 
     with zipfile.ZipFile(bundle_zip, "r") as zf:
-        zip_sizes = collect_zip_sizes(zf)
+        edl_present: Set[str] = {
+            os.path.basename(info.filename)
+            for info in zf.infolist()
+            if info.filename.startswith(EDL_DIR)
+            and not (RAWPROGRAM_RE.search(info.filename) or PATCH_RE.search(info.filename))
+            and os.path.basename(info.filename)
+        }
 
-        for name, data in iter_bundle_xml_entries(zf):
-            if PATCH_RE.search(name):
-                continue
-            try:
-                tree = parse_xml(data)
-            except ET.ParseError:
-                continue
+        # capture XMLs actually present in EDL
+        xml_present: Set[str] = {
+            os.path.basename(info.filename)
+            for info in zf.infolist()
+            if info.filename.startswith(EDL_DIR)
+            and (RAWPROGRAM_RE.search(info.filename) or PATCH_RE.search(info.filename))
+        }
 
-            for elem in tree.getroot().iter():
-                if elem.tag not in PROGRAM_TAGS:
-                    continue
+        # Optional sanity check: manifest.json program_xml/patch_xml should only list present XMLs
+        try:
+            with zf.open("manifest.json", "r") as mf:
+                m = json.load(mf)
+            want_xml = set()
+            for tgt in m.get("targets", []):
+                if isinstance(tgt, dict):
+                    for _, node in tgt.items():
+                        if isinstance(node, dict) and isinstance(node.get("edl"), dict):
+                            edl = node["edl"]
+                            for key in ("program_xml", "patch_xml"):
+                                arr = edl.get(key, [])
+                                if isinstance(arr, list):
+                                    for x in arr:
+                                        if isinstance(x, str):
+                                            want_xml.add(os.path.basename(x))
 
-                lun = _parse_physical_partition(elem.attrib)
-                addr = _parse_start_address(elem.attrib)
-                size = compute_program_size_bytes(elem.attrib, zip_sizes)
-
-                if lun is not None and addr is not None:
-                    # Track the highest end address for this LUN
-                    if size is not None:
-                        end_addr = addr + size
-                    else:
-                        # If no size, just use the address + a nominal amount
-                        end_addr = addr + 4096
-
-                    if lun not in lun_sizes or end_addr > lun_sizes[lun]:
-                        lun_sizes[lun] = end_addr
+            missing_xml_listed_in_manifest = {x for x in want_xml if x not in xml_present}
+            if missing_xml_listed_in_manifest:
+                print("Manifest lists XMLs that are not present in EDL:", file=sys.stderr)
+                for x in sorted(missing_xml_listed_in_manifest):
+                    print(f"  - {x}", file=sys.stderr)
+        except Exception:
+            # If manifest is absent or unparsable, skip this non-fatal check
+            pass
 
     # Compute cumulative offsets (hypothetical sequential layout)
     lun_offsets: Dict[int, int] = {}
@@ -216,6 +232,51 @@ def compute_lun_offsets(bundle_zip: str) -> Dict[int, int]:
         offset += lun_sizes[lun_num]
 
     return lun_offsets
+
+def _update_manifest_edl_lists(manifest_bytes: bytes, keep_xml_basenames: Set[str]) -> bytes:
+    """
+    Given the manifest.json bytes and the set of XML basenames that will remain
+    inside images/qcm6490/edl/, remove any entries in program_xml/patch_xml
+    that are no longer present.
+
+    The structure is:
+      manifest["targets"] -> [ { "<platform>": { "edl": { "program_xml": [...], "patch_xml": [...] } } }, ... ]
+    We don't assume the platform key; we scan all target dicts and patch any that contain an "edl".
+    """
+    try:
+        m = json.loads(manifest_bytes.decode("utf-8"))
+    except Exception:
+        # If manifest can't be parsed, return it unchanged
+        return manifest_bytes
+
+    targets = m.get("targets")
+    if not isinstance(targets, list):
+        return manifest_bytes
+
+    changed = False
+    for tgt in targets:
+        if not isinstance(tgt, dict):
+            continue
+        # Each target is like { "qcm6490": { "edl": {...} } }
+        for _, node in list(tgt.items()):
+            if not isinstance(node, dict):
+                continue
+            edl = node.get("edl")
+            if not isinstance(edl, dict):
+                continue
+
+            for key in ("program_xml", "patch_xml"):
+                arr = edl.get(key)
+                if isinstance(arr, list):
+                    # Filter to only items that actually remain in the bundle
+                    new_arr = [x for x in arr if isinstance(x, str) and os.path.basename(x) in keep_xml_basenames]
+                    if new_arr != arr:
+                        edl[key] = new_arr
+                        changed = True
+
+    if not changed:
+        return manifest_bytes
+    return json.dumps(m, ensure_ascii=False, indent=4).encode("utf-8")
 
 # ----------------------------------------------------------------------
 # list
@@ -434,6 +495,36 @@ def validate_bundle(bundle_zip: str, allow_extra: Optional[Set[str]] = None) -> 
             and not (RAWPROGRAM_RE.search(info.filename) or PATCH_RE.search(info.filename))
             and os.path.basename(info.filename)
         }
+
+        # Optional sanity check: manifest.json program_xml/patch_xml should only list present XMLs
+        manifest_ok = True
+        try:
+            with zf.open("manifest.json", "r") as mf:
+                m = json.load(mf)
+            want = set()
+            for tgt in m.get("targets", []):
+                if isinstance(tgt, dict):
+                    for _, node in tgt.items():
+                        if isinstance(node, dict) and isinstance(node.get("edl"), dict):
+                            edl = node["edl"]
+                            for key in ("program_xml", "patch_xml"):
+                                arr = edl.get(key, [])
+                                if isinstance(arr, list):
+                                    for x in arr:
+                                        if isinstance(x, str):
+                                            want.add(os.path.basename(x))
+            missing_from_manifest = {x for x in want if x not in edl_present}
+            if missing_from_manifest:
+                manifest_ok = False
+                print("Manifest lists XMLs that are not present in EDL:", file=sys.stderr)
+                for x in sorted(missing_from_manifest):
+                    print(f"  - {x}", file=sys.stderr)
+        except KeyError:
+            pass
+        except Exception:
+            # If manifest is absent or unparsable, we skip this check
+            pass
+
         referenced: Set[str] = set()
         for name, data in iter_bundle_xml_entries(zf):
             try:
@@ -578,6 +669,22 @@ def rewrite_bundle_with_filter(src_zip: str, dst_zip: str, mode: str, parts: Set
                     sys.exit(4)
                 else:
                     print(msg, file=sys.stderr)
+
+        # Determine which EDL XMLs (rawprogram/patch) will remain in the new bundle
+        keep_xml_basenames: Set[str] = set()
+        for info in zin.infolist():
+            name = info.filename
+            if not name.startswith(EDL_DIR):
+                continue
+            # We only care about rawprogram*.xml and patch*.xml
+            if not (RAWPROGRAM_RE.search(name) or PATCH_RE.search(name)):
+                continue
+            if name in xml_empty:
+                # Will be dropped because it became empty
+                continue
+            # This XML remains (possibly modified)
+            keep_xml_basenames.add(os.path.basename(name))
+
         with zipfile.ZipFile(dst_zip, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as zout:
             written: Set[str] = set()
             for info in zin.infolist():
@@ -587,12 +694,27 @@ def rewrite_bundle_with_filter(src_zip: str, dst_zip: str, mode: str, parts: Set
                 if name in xml_empty:
                     continue
                 data = zin.read(info)
+
+                # Replace XMLs with modified versions (if any)
                 if name in xml_modified:
                     data = xml_modified[name]
+
+                # Drop empty rawprogram XMLs entirely
+                if name in xml_empty:
+                    continue
+
+                # Prune unreferenced EDL payload files (kept behavior)
                 if name.startswith(EDL_DIR) and not (RAWPROGRAM_RE.search(name) or PATCH_RE.search(name)):
                     base = os.path.basename(name)
-                    if base and base not in referenced_after_all:
-                        continue
+                    # do not prune firehose loaders
+                    if base not in ALWAYS_KEEP_IN_EDL:
+                        if base and base not in referenced_after_all:
+                            continue
+
+                # Update manifest.json to reflect remaining XMLs
+                if name == "manifest.json":
+                   data = _update_manifest_edl_lists(data, keep_xml_basenames)
+
                 if name in written:
                     continue
                 zout.writestr(name, data)
